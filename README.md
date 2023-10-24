@@ -1,4 +1,4 @@
-# LabelGenius - GPT-Powered Media Text Labeller
+# LabelGenius - GPT-Powered Media Text Labeler
 ## A Tool for Dynamic and Flexible Labeling with GPT Models for Media Text Classification
 This GitHub repository holds the code and materials designed for a dynamic and innovative approach to text classification using GPT-4 and GPT-3.5 models. It introduces an iterative refinement process, initiating the classification with GPT-4 and progressively enhancing accuracy through human validation and model fine-tuning.
 
@@ -9,7 +9,7 @@ The original replication code and codebook can be found in the replication folde
 - [Chris Chao Su](https://github.com/chrischaosu)
 
 ## To cite this tool:
-Huang, J., & Su, C.C. (2023). LabelGenius-GPT-Powered Media Text Labeller: A Tool for Dynamic and Flexible Labeling with GPT Models for Media Text Classification [Computer software]. https://github.com/mediaccs/LabelGenius
+Huang, J., & Su, C.C. (2023). LabelGenius-GPT-Powered Media Text Labeler: A Tool for Dynamic and Flexible Labeling with GPT Models for Media Text Classification [Computer software]. https://github.com/mediaccs/LabelGenius
 
 ## Overview
 ### Iterative Refinement and Dynamic Labeling Process
