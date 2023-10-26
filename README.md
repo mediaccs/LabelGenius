@@ -79,9 +79,9 @@ We can now go ahead and classify the texts
 
 *once_verify_num:* Number of results generated from GPT in each classification attempt.
 
-    The once_verify_num parameter signifies how many distinct outcomes the GPT model produces within a single verification round. For instance, if       once_verify_num is set to 5, the system will generate five unique results for the same input prompt in a single attempt. These results are then      compared to deduce a consensus.
-    
-    To determine the definitive answer, the frequency of each unique result is calculated. If there's a unique maximum frequency, that result is         chosen. However, in cases where multiple results share the highest frequency, this indicates a lack of convergence. The system will then retry       the classification, generating a new set of results. These new results will be combined with the old ones, and the process is repeated until a       unique answer with the highest frequency is found or until the max_verify_retry limit is reached.
+The once_verify_num parameter signifies how many distinct outcomes the GPT model produces within a single verification round. For instance, if       once_verify_num is set to 5, the system will generate five unique results for the same input prompt in a single attempt. These results are then      compared to deduce a consensus.
+
+To determine the definitive answer, the frequency of each unique result is calculated. If there's a unique maximum frequency, that result is         chosen. However, in cases where multiple results share the highest frequency, this indicates a lack of convergence. The system will then retry       the classification, generating a new set of results. These new results will be combined with the old ones, and the process is repeated until a       unique answer with the highest frequency is found or until the max_verify_retry limit is reached.
 
 ### Example 1 single theme variable
 #### Q1: Is this news article related to immigration in the United States? 
