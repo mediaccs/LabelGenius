@@ -57,9 +57,9 @@ openai.api_key = "YOUR-API-Key"
 ## Step 1: Annoate the task 
 We can now go ahead and classify the texts
 
-## Function: gpt_classifier.classify_df
+**Function**: gpt_classifier.classify_df
 
-## Parameters:
+**Parameters**:
 
 *column:* Name of the column containing media-text to be classified.
 
