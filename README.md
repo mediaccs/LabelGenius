@@ -37,8 +37,6 @@ Every iteration of classification and validation refines the model's understandi
 
 ## Installation
 
-Not sure how this works = =
-
 ```python
 # load packages 
 from gpt_classify_function import *
