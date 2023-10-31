@@ -4,12 +4,13 @@ This GitHub repository holds the code and materials designed for a dynamic and i
 
 The original replication code and codebook can be found in the replication folder ("example").
 
-## Authors
+<!-- ## Authors
 - [Jiacheng Huang](https://github.com/JcHuang11234)
 - [Chris Chao Su](https://github.com/chrischaosu)
 
 ## To cite this tool:
 Huang, J., & Su, C.C. (2023). LabelGenius-GPT-Powered Media Text Labeler: A Tool for Dynamic and Flexible Labeling with GPT Models for Media Text Classification [Computer software]. https://github.com/mediaccs/LabelGenius
+-->
 
 ## Overview
 ### Iterative Refinement and Dynamic Labeling Process
