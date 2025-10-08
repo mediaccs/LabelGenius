@@ -1,0 +1,49 @@
+[project]
+name = "labelgenius"
+version = "0.1.1"
+description = "Flexible GPT + CLIP classification toolkit for multimodal labeling"
+readme = "README.md"
+requires-python = ">=3.9"
+license = {text = "MIT"}
+authors = [
+  {name = "Jiacheng Huang, M.S.", email = "huan1660@umn.edu"},
+  {name = "Zhongxing Zhang, M.S.", email = "zhan8889@umn.edu"},
+  {name = "Chris Chao Su, Ph.D.", email = "suchao@bu.edu"}
+]
+keywords = ["gpt", "clip", "classification", "multimodal", "llm", "openai", "vision", "research"]
+
+classifiers = [
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.9",
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: OS Independent",
+    "Intended Audience :: Science/Research",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+]
+
+dependencies = [
+    "torch>=2.0.0",
+    "transformers>=4.30.0",
+    "pandas",
+    "numpy",
+    "tqdm",
+    "pillow",
+    "sqlitedict",
+    "loguru",
+    "openai>=1.0.0",
+    "scikit-learn",
+    "torchvision"
+]
+
+[project.urls]
+Homepage = "https://github.com/mediaccs/LabelGenius"
+Repository = "https://github.com/mediaccs/LabelGenius"
+Issues = "https://github.com/mediaccs/LabelGenius/issues"
+
+[build-system]
+requires = ["setuptools>=61.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["labelgenius*"]
