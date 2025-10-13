@@ -286,6 +286,7 @@ class NewsDataset(Dataset):
 
         return inputs, label
 
+
 def classification_CLIP_finetuned(
     mode=None,
     text_path=None,
@@ -294,25 +295,48 @@ def classification_CLIP_finetuned(
     prompt=None,
     model_name="best_clip_model.pth",
     batch_size=8,
-    num_classes=24,
+    num_classes=None,   # auto-detected
     predict_column="label",
-    true_label=None):
+    true_label=None
+):
     if mode not in ["text", "image", "both"]:
         raise ValueError("mode must be one of 'text', 'image', or 'both'")
 
-    if text_path.endswith(".csv") or text_path.endswith("txt"):
+    # --- Load input data ---
+    if text_path.endswith(".csv") or text_path.endswith(".txt"):
         df = pd.read_csv(text_path)
     elif text_path.endswith(".jsonl"):
         df = pd.read_json(text_path, lines=True)
-    elif text_path.endswith(".xlsx") or text_path.endswith(".xls"):
+    elif text_path.endswith((".xlsx", ".xls")):
         df = pd.read_excel(text_path)
     else:
         raise ValueError("Unsupported file format")
-    print(f"{len(df)} pieces of data loaded")
+    print(f"📄 Loaded {len(df)} samples for prediction")
 
     _device   = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     processor = CLIPProcessor.from_pretrained(base_model)
 
+    # --- Load checkpoint safely ---
+    if not os.path.exists(model_name):
+        raise ValueError(f"Model weights file does not exist: {model_name}")
+
+    try:
+        checkpoint = torch.load(model_name, map_location=_device, weights_only=True)
+    except Exception:
+        print("⚠️ Safe load failed, retrying with weights_only=False ...")
+        checkpoint = torch.load(model_name, map_location=_device, weights_only=False)
+
+    # --- Auto-detect num_classes from checkpoint ---
+    if num_classes is None:
+        num_classes = checkpoint.get("num_classes", None)
+        if num_classes is None:
+            if "model_state_dict" in checkpoint and "classifier.weight" in checkpoint["model_state_dict"]:
+                num_classes = checkpoint["model_state_dict"]["classifier.weight"].shape[0]
+            else:
+                num_classes = 2  # fallback
+        print(f"🔍 Detected num_classes={num_classes} from checkpoint")
+
+    # --- Build model skeleton ---
     model = CLIPClassifier(
         CLIPModel.from_pretrained(base_model),
         num_classes,
@@ -320,31 +344,57 @@ def classification_CLIP_finetuned(
         use_image=(mode in ["image", "both"]),
     ).to(_device)
 
-    if not os.path.exists(model_name):
-        raise ValueError(f"Model weights file does not exist: {model_name}")
+    # --- Load weights with head-shape safety ---
+    state_dict = checkpoint.get("model_state_dict", checkpoint)
+    head_mismatch = False
 
-    checkpoint = torch.load(model_name, map_location=_device, weights_only=True)
-    model.load_state_dict(checkpoint["model_state_dict"])
+    if "classifier.weight" in state_dict:
+        ckpt_head_dim = state_dict["classifier.weight"].shape[0]
+        if ckpt_head_dim != num_classes:
+            head_mismatch = True
+            print(f"⚠️ Head mismatch: checkpoint={ckpt_head_dim}, model={num_classes}. "
+                  f"Re-initializing classifier head ...")
+            # Remove incompatible head weights
+            state_dict.pop("classifier.weight", None)
+            state_dict.pop("classifier.bias", None)
+
+    missing, unexpected = model.load_state_dict(state_dict, strict=False)
+    if missing:
+        print(f"⚙️ Missing keys (expected for head reset): {missing}")
+    if unexpected:
+        print(f"⚙️ Unexpected keys: {unexpected}")
+    if head_mismatch:
+        print("✅ Classifier head reset successfully.")
+
     model.eval()
 
+    # --- Dataset + Dataloader ---
     dataset = NewsDataset(
-        df, text_column=text_column, img_dir=img_dir, processor=processor, prompt=prompt, true_label=true_label
+        df,
+        processor,
+        text_column=text_column,
+        img_dir=img_dir,
+        use_text=(mode in ["text", "both"]),
+        use_image=(mode in ["image", "both"]),
+        true_label=true_label,
+        prompt=prompt,
     )
     dataloader = DataLoader(dataset, batch_size=batch_size, shuffle=False)
 
+    # --- Predict ---
     predictions = []
     with torch.no_grad():
-        for _, (inputs, _) in enumerate(tqdm(dataloader, desc="predicting")):
+        for _, (inputs, _) in enumerate(tqdm(dataloader, desc="Predicting")):
             for k, v in inputs.items():
                 inputs[k] = v.to(_device)
             logits, _ = model(**inputs)
             _, predicted = logits.max(1)
-            predicted = predicted + 1
-            predictions.extend(predicted.cpu().numpy())
+            predictions.extend((predicted + 1).cpu().numpy())
 
     df[predict_column] = predictions
-    print("Labeling completed!")
+    print(f"✅ Prediction complete! {len(df)} rows labeled.")
     return df
+
 
 def finetune_CLIP(
     mode="both",
@@ -356,53 +406,86 @@ def finetune_CLIP(
     model_name="best_clip_model.pth",
     num_epochs=20,
     batch_size=8,
-    learning_rate=1e-5):
+    learning_rate=1e-5
+):
+    """
+    Fine-tune CLIP on a text, image, or multimodal dataset.
+
+    Automatically detects the number of classes from the `true_label` column.
+    """
+
     if mode not in ["text", "image", "both"]:
         raise ValueError("mode must be one of 'text', 'image', or 'both'")
+
     use_text  = mode in ["text", "both"]
     use_image = mode in ["image", "both"]
+
     if use_text and not text_path:
         raise ValueError("text_path cannot be empty")
     if use_image and not img_dir:
         raise ValueError("img_dir cannot be empty")
-    if not use_text and not use_image:
-        raise ValueError("At least one of text or image mode must be enabled")
 
-    if text_path.endswith(".csv") or text_path.endswith("txt"):
+    # === Load dataset ===
+    if text_path.endswith(".csv") or text_path.endswith(".txt"):
         df = pd.read_csv(text_path)
     elif text_path.endswith(".jsonl"):
         df = pd.read_json(text_path, lines=True)
-    elif text_path.endswith(".xlsx") or text_path.endswith(".xls"):
+    elif text_path.endswith((".xlsx", ".xls")):
         df = pd.read_excel(text_path)
     else:
         raise ValueError("Unsupported file format")
-    print(f"Loaded {len(df)} records")
 
-    val_size = int(len(df) * 0.2)
-    train_df, val_df = df.iloc[:-val_size], df.iloc[-val_size:]
+    print(f"📂 Loaded {len(df)} records from {os.path.basename(text_path)}")
 
-    if min(df[true_label].unique()) == 1:
-        num_classes = int(df[true_label].max())
+    if true_label not in df.columns:
+        raise ValueError(f"Label column '{true_label}' not found in dataset")
+
+    # === Auto-detect number of classes ===
+    unique_labels = sorted(df[true_label].dropna().unique())
+    num_classes = len(unique_labels)
+
+    # Handle indexing (0 vs 1-based)
+    if 0 not in unique_labels and 1 in unique_labels:
+        label_min = int(min(unique_labels))
+        label_shift = 1 - label_min
+        if label_shift != 0:
+            df[true_label] = df[true_label] + label_shift
     else:
-        num_classes = int(df[true_label].max()) + 1
+        label_shift = 0
 
-    # --- FORCE CPU FOR FINE-TUNING ON MPS ---
+    print(f"🔍 Detected {num_classes} classes: {unique_labels}")
+    if label_shift != 0:
+        print(f"⚙️ Shifted labels by +{label_shift} for zero-based indexing.")
+
+    # === Train/validation split ===
+    if len(df) < 5:
+        train_df, val_df = df, df
+        print("⚠️ Dataset too small for validation split; using full dataset for training.")
+    else:
+        val_size = int(len(df) * 0.2)
+        train_df = df.iloc[:-val_size].reset_index(drop=True)
+        val_df   = df.iloc[-val_size:].reset_index(drop=True)
+
+    # === Device ===
     training_device = device
     if device.type == "mps":
         training_device = torch.device("cpu")
-        print(f"⚠️  MPS detected. Using CPU for fine-tuning to avoid tensor layout issues.")
-    else:
-        print(f"Using device for fine-tuning: {training_device}")
+        print(f"⚠️ MPS detected → using CPU to avoid tensor layout issues.")
+    print(f"💻 Using device: {training_device}")
 
-    print(f"Number of classes: {num_classes}")
-    print(f"Use text: {use_text}, Use image: {use_image}")
-    print(f"Text columns: {text_column}")
-    print(f"Label column: {true_label}")
+    print(f"🧠 Training setup:")
+    print(f"   • Mode: {mode}")
+    print(f"   • Text columns: {text_column}")
+    print(f"   • Label column: {true_label}")
+    print(f"   • Number of classes: {num_classes}")
+    print(f"   • Batch size: {batch_size}, Epochs: {num_epochs}, LR: {learning_rate}")
+
     if prompt:
-        print(f"Using prompt: {prompt}")
+        print(f"   • Prompt: {prompt}")
 
+    # === Model & processor ===
     clip_model = CLIPModel.from_pretrained(base_model)
-    processor = CLIPProcessor.from_pretrained(base_model)
+    processor  = CLIPProcessor.from_pretrained(base_model)
 
     train_dataset = NewsDataset(
         train_df, processor, text_column=text_column, img_dir=img_dir,
@@ -416,22 +499,21 @@ def finetune_CLIP(
     train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True)
     val_loader   = DataLoader(val_dataset, batch_size=batch_size, shuffle=False)
 
-    # Use training_device instead of device
+    # === Model, optimizer, loss ===
     model = CLIPClassifier(clip_model, num_classes, use_text, use_image).to(training_device)
     optimizer = AdamW(model.parameters(), lr=learning_rate)
     criterion = torch.nn.CrossEntropyLoss()
 
+    # === Training loop ===
     best_accuracy = 0.0
     for epoch in range(num_epochs):
         model.train()
-        train_loss = 0.0
-        train_correct = 0
-        train_total = 0
+        total_loss, correct, total = 0, 0, 0
 
         for batch_idx, (inputs, labels) in enumerate(tqdm(train_loader, desc=f"Epoch {epoch+1}/{num_epochs} [Train]")):
             for k, v in inputs.items():
-                inputs[k] = v.to(training_device)  # Use training_device
-            labels = labels.to(training_device)  # Use training_device
+                inputs[k] = v.to(training_device)
+            labels = labels.to(training_device)
 
             optimizer.zero_grad()
             logits, _ = model(**inputs)
@@ -439,50 +521,50 @@ def finetune_CLIP(
             loss.backward()
             optimizer.step()
 
-            train_loss += loss.item()
+            total_loss += loss.item()
             _, predicted = logits.max(1)
-            train_total += labels.size(0)
-            train_correct += predicted.eq(labels).sum().item()
+            total += labels.size(0)
+            correct += predicted.eq(labels).sum().item()
 
-            if (batch_idx + 1) % 10 == 0:
-                print(f"Batch {batch_idx+1}/{len(train_loader)}: Loss: {loss.item():.4f} | Acc: {100.*train_correct/train_total:.2f}%")
+        train_acc = 100. * correct / total
+        train_loss = total_loss / len(train_loader)
 
+        # === Validation ===
         model.eval()
-        val_loss = 0.0
-        val_correct = 0
-        val_total = 0
-        all_preds, all_labels = [], []
-
+        val_correct, val_total, val_loss = 0, 0, 0.0
         with torch.no_grad():
             for inputs, labels in tqdm(val_loader, desc=f"Epoch {epoch+1}/{num_epochs} [Val]"):
                 for k, v in inputs.items():
-                    inputs[k] = v.to(training_device)  # Use training_device
-                labels = labels.to(training_device)  # Use training_device
+                    inputs[k] = v.to(training_device)
+                labels = labels.to(training_device)
 
                 logits, _ = model(**inputs)
                 loss = criterion(logits, labels)
-
                 val_loss += loss.item()
                 _, predicted = logits.max(1)
                 val_total += labels.size(0)
                 val_correct += predicted.eq(labels).sum().item()
 
-                all_preds.extend(predicted.cpu().numpy())
-                all_labels.extend(labels.cpu().numpy())
+        val_acc = 100. * val_correct / val_total if val_total else 0
+        val_loss = val_loss / len(val_loader)
 
-        train_loss = train_loss / len(train_loader)
-        train_acc  = 100.0 * train_correct / train_total
-        val_loss   = val_loss / len(val_loader)
-        val_acc    = 100.0 * val_correct / val_total
+        print(f"Epoch {epoch+1}/{num_epochs}: "
+              f"Train Loss={train_loss:.4f} Acc={train_acc:.2f}% | "
+              f"Val Loss={val_loss:.4f} Acc={val_acc:.2f}%")
 
-        print(f"Epoch {epoch+1}/{num_epochs}: Train Loss: {train_loss:.4f} | Train Acc: {train_acc:.2f}% | Val Loss: {val_loss:.4f} | Val Acc: {val_acc:.2f}%")
-
+        # === Save best model ===
         if val_acc > best_accuracy:
             best_accuracy = val_acc
-            torch.save({"model_state_dict": model.state_dict(), "epoch": epoch, "best_accuracy": best_accuracy}, model_name)
-            print(f"Model saved! Best validation accuracy: {best_accuracy:.2f}%")
+            torch.save({
+                "model_state_dict": model.state_dict(),
+                "epoch": epoch + 1,
+                "best_accuracy": best_accuracy,
+                "num_classes": num_classes,
+                "label_mapping": unique_labels
+            }, model_name)
+            print(f"✅ Model saved! New best validation accuracy: {best_accuracy:.2f}%")
 
-    print(f"Fine-tuning complete! Best validation accuracy: {best_accuracy:.2f}%")
+    print(f"🎯 Fine-tuning complete! Best validation accuracy: {best_accuracy:.2f}%")
     return best_accuracy
 
 # =========================
@@ -1001,7 +1083,7 @@ def generate_GPT_finetune_jsonl(
 
 def finetune_GPT(
     training_file_path: str,
-    model: str = "gpt-4o-mini",
+    model: str = None,
     method_type: str = "supervised",
     hyperparameters: dict = None,
     poll_interval: int = 15,
