@@ -31,7 +31,7 @@ pip install labelgenius
 
 **Pinned version:**
 ```bash
-pip install labelgenius==0.1.4
+pip install labelgenius==0.1.5
 ```
 
 **From source:**
