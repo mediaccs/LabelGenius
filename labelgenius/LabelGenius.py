@@ -627,13 +627,17 @@ class ClassificationQuestion:
     max_verify_retry: int = 2
 
     def get_key(self) -> str:
+        # Normalize text & prompt to improve cache hit chance
+        norm_prompt = (self.prompt or "").strip().lower()
+        norm_text = (self.text or "").strip().lower()
+    
         parts = [
-            self.prompt,
+            norm_prompt,
             self.model_name,
-            ",".join(self.valid_values),
+            ",".join(sorted(self.valid_values)),  # sort to normalize order
             str(self.reasoning_effort),
             self.column_4_labeling,
-            self.text or "",
+            norm_text,
             str(self.label_num),
             str(self.max_verify_retry),
         ]
@@ -649,7 +653,7 @@ class ClassificationTask:
     column_4_labeling: str
     label_num: int = 1
     once_verify_num: int = 1
-    max_verify_retry: int = 3
+    max_verify_retry: int = 5
 
     def create_question(self, content: str) -> ClassificationQuestion:
         return ClassificationQuestion(
@@ -683,6 +687,46 @@ class GPTClassifier:
     def __init__(self, client: OpenAI):
         self.client = client
         self.cache  = DBCache()
+
+    @staticmethod
+    def _validate_output(candidate, valid_values: list[str], num_themes: int):
+        """
+        Normalize and validate a single candidate output.
+
+        Returns:
+            list[int] of length num_themes if valid, else None.
+        """
+        if candidate is None:
+            return None
+
+        # Normalize candidate to a list
+        if isinstance(candidate, (str, int)):
+            candidate = [candidate]
+
+        if not isinstance(candidate, (list, tuple)):
+            return None
+
+        # Convert values to strings, strip, and check membership
+        norm_strs = []
+        for v in candidate:
+            s = str(v).strip()
+            # accept bare integers like 5 as "5"
+            if s.isdigit() and s in valid_values:
+                norm_strs.append(s)
+            else:
+                # if it looks like "05" or non-digit tokens, reject
+                return None
+
+        # Length must match exactly
+        if len(norm_strs) != int(num_themes):
+            return None
+
+        # All values must be in valid_values
+        if any(s not in valid_values for s in norm_strs):
+            return None
+
+        # Convert to ints for downstream convenience
+        return [int(s) for s in norm_strs]
 
     # -- Helpers: Responses-API wrapping --
     @staticmethod
@@ -771,6 +815,12 @@ class GPTClassifier:
 
     # -- SINGLE call → parsed labels (now forwards temperature) --
     def classify(self, q: ClassificationQuestion, n: int, temperature: float | None = None):
+        """
+        Run a single GPT call that may return up to n choices.
+        Returns:
+            parsed: list of parsed candidates (each candidate is list or scalar-like)
+            raw_texts: list of raw text replies for logging
+        """
         if q.column_4_labeling == "text_class":
             content = [
                 {"type": "text", "text": str(q.prompt)},
@@ -801,58 +851,229 @@ class GPTClassifier:
         )
 
         parsed = []
-        for reply in (c.message.content.strip() for c in resp.choices):
-            if reply.startswith("[") and reply.endswith("]"):
+        raw_texts = []
+        for choice in resp.choices:
+            raw = choice.message.content.strip() if getattr(choice, "message", None) else ""
+            raw_texts.append(raw)
+
+            # Try JSON-like list first
+            if raw.startswith("[") and raw.endswith("]"):
                 try:
-                    arr = json.loads(reply)
-                    if isinstance(arr, list) and len(arr) == q.label_num and all(str(x) in q.valid_values for x in arr):
-                        parsed.append([int(x) for x in arr])
-                        continue
+                    arr = json.loads(raw)
+                    parsed.append(arr)
+                    continue
                 except Exception:
                     pass
-            flat = re.findall(r"\b[01]\b", reply)
-            if len(flat) == q.label_num:
-                parsed.append([int(x) for x in flat])
+
+            # Try simple digits separated by commas or spaces
+            flat = re.findall(r"\b\d+\b", raw)
+            if flat:
+                parsed.append([int(x) if x.isdigit() else x for x in flat])
                 continue
-            matches = [p.strip(' ."') for p in reply.split(",") if p.strip(' ."') in q.valid_values]
-            if matches:
-                parsed.append(matches[: q.label_num])
-                continue
-            m = re.search(r"\b(\d{1,2})\b", reply)
-            if m and m.group(1) in q.valid_values:
-                parsed.append([m.group(1)])
+
+            # As a last resort, keep raw as-is (will fail validation)
+            parsed.append(raw)
 
         if not parsed:
             logger.error(f"No valid labels parsed. Raw reply: {resp.choices}")
-        return parsed
+        return parsed, raw_texts
+
 
     # -- majority vote / cache (now forwards temperature) --
-    def multi_verify(self, q: ClassificationQuestion, n, retry=1, freq=None, temperature: float | None = None):
-        res = self.classify(q, n, temperature=temperature)
-        if not res and retry < q.max_verify_retry:
-            return self.multi_verify(q, n, retry + 1, temperature=temperature)
-        if not res:
-            raise MaxRetryException("No valid responses")
+    def multi_verify(
+        self,
+        q: ClassificationQuestion,
+        n,
+        retry=1,
+        freq=None,
+        temperature: float | None = None,
+        counters: dict | None = None
+    ):
+        """
+        Robust per-row classification:
+          - Checks SQLite cache first
+          - Validates each attempt immediately
+          - Retries up to q.max_verify_retry times
+          - Caches only valid outputs
+          - Returns [99,...] on final failure (not cached)
+          - IMPORTANT: counters['redo'] counts TRUE retries only
+                       (i.e., second attempt and beyond), never the first try.
+        """
+        # 1) Cache check
+        cached = self.cache.get(q)
+        if cached is not None:
+            return cached
+    
+        max_retry = max(1, int(q.max_verify_retry))
+        attempt = 1
+        total_retries_this_row = 0
+        last_error = None
+        row_tag = f"{getattr(q, 'row_idx', '?')}"
+    
+        while attempt <= max_retry:
+            try:
+                parsed_list, raw_list = self.classify(q, n, temperature=temperature)
+            except Exception as e:
+                last_error = e
+                # Only a retry if we're going to try again
+                if attempt < max_retry:
+                    total_retries_this_row += 1
+                    if counters is not None:
+                        counters["redo"] += 1
+                    print(f"Row {row_tag} RETRY #{total_retries_this_row} — API error: {type(e).__name__}: {e}")
+                    attempt += 1
+                    continue
+                # No more retries left
+                break
 
-        if isinstance(res[0], list) and len(res[0]) == q.label_num:
-            self.cache.add(q, res[0])
-            return res[0]
+            # Validate candidates
+            counts = {}
+            first_parsed_preview = None
+            first_raw_preview = None
+    
+            for idx, cand in enumerate(parsed_list or []):
+                if first_parsed_preview is None:
+                    first_parsed_preview = cand
+                if first_raw_preview is None:
+                    first_raw_preview = (raw_list[idx] if raw_list and idx < len(raw_list) else "")
+    
+                valid = self._validate_output(cand, q.valid_values, q.label_num)
+                if valid is not None:
+                    t = tuple(valid)
+                    counts[t] = counts.get(t, 0) + 1
+    
+            if counts:
+                # Success: majority vote
+                best_tuple = sorted(counts.items(), key=lambda kv: kv[1], reverse=True)[0][0]
+                best = list(best_tuple)
+                self.cache.add(q, best)
+                return best
+    
+            # Invalid output
+            parsed_preview_str = str(first_parsed_preview)
+            raw_preview_str = (first_raw_preview or "").replace("\n", " ")[:200]
+    
+            if attempt < max_retry:
+                # We WILL retry → count it
+                total_retries_this_row += 1
+                if counters is not None:
+                    counters["redo"] += 1
+                print(
+                    f"Row {row_tag} RETRY #{total_retries_this_row} — invalid output: "
+                    f"{parsed_preview_str} (expected {q.label_num} labels). Raw: \"{raw_preview_str}\""
+                )
+                attempt += 1
+                continue
+    
+            # No retries left, fall through to failure
+            break
+    
+        # Final failure
+        fail_reason = (
+            f"{type(last_error).__name__}: {last_error}"
+            if last_error is not None else
+            "invalid format repeatedly."
+        )
+        print(f"Row {row_tag} FAILED after {total_retries_this_row} retries. Last reason: {fail_reason}")
+        return [99] * int(q.label_num)
 
-        freq = freq or {}
-        for r in res:
-            lbl = r[0]
-            freq[lbl] = freq.get(lbl, 0) + 1
-        top = sorted(freq, key=freq.get, reverse=True)[: q.label_num]
-        self.cache.add(q, top)
-        return top
+    
+    def classify_df(
+        self,
+        df: pd.DataFrame,
+        task: ClassificationTask,
+        return_sample_response=False,
+        temperature: float | None = None,
+        pbar=None,
+        counters=None
+    ):
+        """
+        Row-by-row processing:
+          - Counts cache hits in counters['cache']
+          - Counts TRUE retries in counters['redo'] (handled inside multi_verify)
+          - Progress bar postfix shows: ⚡ cache:<n> | retry:<m>
+        """
+        out, sample = [], None
+    
+        for idx, rec in enumerate(df.to_dict("records")):
+            q = task.create_question(rec.get(task.column, ""))
+            setattr(q, "row_idx", idx)
+    
+            # Cache check BEFORE classification (does not affect redo)
+            if self.cache.get(q) is not None:
+                if counters is not None:
+                    counters["cache"] += 1
+    
+            if return_sample_response and sample is None:
+                sample = self.fetch(
+                    [{"role": "user",
+                      "content": [
+                          {"type": "text", "text": str(q.prompt)},
+                          {"type": "text", "text": str(q.text)}
+                      ]}],
+                    q.model_name,
+                    q.reasoning_effort or "minimal",
+                    1,
+                    temperature=temperature,
+                )
+    
+            try:
+                lbl = self.multi_verify(
+                    q,
+                    task.once_verify_num,
+                    temperature=temperature,
+                    counters=counters,  # <- redo counted ONLY here, on true retries
+                )
+            except Exception as e:
+                print(f"Row {idx} ERROR — {type(e).__name__}: {e}")
+                lbl = [99] * int(task.label_num)
+    
+            rec[task.column_4_labeling] = lbl
+            out.append(rec)
+    
+            # Progress bar update
+            if pbar is not None:
+                postfix = (
+                    f"⚡ cache:{counters['cache']}"
+                    if counters else ""
+                )
+                pbar.set_postfix_str(postfix, refresh=True)
+                pbar.update(1)
+    
+        df_out = pd.DataFrame(out)
+        return (df_out, sample) if return_sample_response else df_out
+
 
     # -- DataFrame helper (now forwards temperature) --
     def classify_df(self, df: pd.DataFrame, task: ClassificationTask,
-                    return_sample_response=False, temperature: float | None = None):
+                    return_sample_response=False, temperature: float | None = None,
+                    pbar=None, counters=None):
+        """
+        Processes dataframe row by row:
+        ✅ Tracks cache hits & re-runs
+        ✅ Shows ⚡ cache inline on progress bar
+        ✅ Updates tqdm postfix dynamically
+        """
         out, sample = [], None
-        for rec in df.to_dict("records"):  # no tqdm here
+    
+        for idx, rec in enumerate(df.to_dict("records")):
             q = task.create_question(rec.get(task.column, ""))
+            try:
+                setattr(q, "row_idx", idx)
+            except:
+                pass
+    
+            # Check cache BEFORE calling multi_verify
+            cache_hit = self.cache.get(q) is not None
+    
+            if cache_hit:
+                if counters:
+                    counters["cache"] += 1
+            else:
+                if counters:
+                    counters["redo"] += 1
 
+    
             if return_sample_response and sample is None:
                 sample = self.fetch(
                     [{"role": "user",
@@ -863,16 +1084,23 @@ class GPTClassifier:
                     1,
                     temperature=temperature,
                 )
-
+    
             try:
                 lbl = self.multi_verify(q, task.once_verify_num, temperature=temperature)
             except Exception as e:
-                logger.error(e)
-                lbl = ["99"] * task.label_num
+                # Print clear reason for retry
+                print(f"Row {getattr(q, 'row_idx', '?')} RETRY #{attempts+1} — error: {str(e)}")
+                lbl = [99] * int(q.label_num)
 
             rec[task.column_4_labeling] = lbl
             out.append(rec)
-
+    
+            # ✅ tqdm updates
+            if pbar is not None:
+                postfix = f"⚡ cache: {counters['cache']} " if counters else ""
+                pbar.set_postfix_str(postfix, refresh=True)
+                pbar.update(1)
+    
         df_out = pd.DataFrame(out)
         return (df_out, sample) if return_sample_response else df_out
 
@@ -982,9 +1210,23 @@ def classification_GPT(
     outputs = []
     n = len(df)
     
-    # one global progress bar
-    pbar = tqdm(total=n, desc=f"Classifying {tasks[0][1]}", unit="item")
+    # Global counters
+    counters = {"cache": 0, "redo": 0}
     
+    pbar = tqdm(
+        total=n,
+        desc=f"[ GPT • {tasks[0][1]} ]",
+        unit="row",
+        ncols=100,
+        dynamic_ncols=False,
+        leave=True,
+        position=0,
+        mininterval=0.5,
+        smoothing=0.1,
+        bar_format="{desc} {percentage:3.0f}%|{bar}| {n_fmt}/{total_fmt} | ETA {remaining} | {rate_fmt} | {postfix}"
+    )
+
+
     for start in range(0, n, max(1, batch_size)):
         end = min(n, start + max(1, batch_size))
         sub = df.iloc[start:end].copy()
@@ -994,17 +1236,24 @@ def classification_GPT(
                 column=col, prompt=pr, model_name=model,
                 valid_values=category, reasoning_effort=reasoning_effort,
                 column_4_labeling=lab, label_num=num_themes,
-                once_verify_num=num_votes, max_verify_retry=num_votes,
+                once_verify_num=num_votes, max_verify_retry=5,
             )
     
-            # tell classify_df not to create its own tqdm
-            sub = clf.classify_df(sub, task, temperature=temperature)
-        
+            # Pass counters + tqdm bar
+            sub = clf.classify_df(sub, task, temperature=temperature, pbar=pbar, counters=counters)
+    
         outputs.append(sub)
-        pbar.update(len(sub))  # move main progress bar
         time.sleep(wait_time)
     
+    # Ensure bar completes cleanly
+    pbar.n = pbar.total
+    pbar.refresh()
     pbar.close()
+    
+    print(f"\n✅ Finished classification of {n} rows.")
+
+
+    
 
 
     df = pd.concat(outputs, ignore_index=True)
