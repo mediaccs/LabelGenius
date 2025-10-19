@@ -287,6 +287,177 @@ class NewsDataset(Dataset):
         return inputs, label
 
 
+# ==== PATCH: finetune_CLIP (start) ===========================================
+def finetune_CLIP(
+    mode="both",
+    text_path=None,
+    text_column=None,
+    img_dir=None,
+    true_label=None,
+    prompt=None,
+    model_name="best_clip_model.pth",
+    num_epochs=20,
+    batch_size=8,
+    learning_rate=1e-5
+):
+    """
+    Fine-tune CLIP on a text, image, or multimodal dataset.
+
+    Internally remaps labels to 0..N-1 for CrossEntropyLoss.
+    Saves a mapping back to original labels in the checkpoint so predictions can be returned in original space.
+    """
+
+    if mode not in ["text", "image", "both"]:
+        raise ValueError("mode must be one of 'text', 'image', or 'both'")
+
+    use_text  = mode in ["text", "both"]
+    use_image = mode in ["image", "both"]
+
+    if use_text and not text_path:
+        raise ValueError("text_path cannot be empty")
+    if use_image and not img_dir:
+        raise ValueError("img_dir cannot be empty")
+
+    # --- Load dataset ---
+    if text_path.endswith(".csv") or text_path.endswith(".txt"):
+        df = pd.read_csv(text_path)
+    elif text_path.endswith(".jsonl"):
+        df = pd.read_json(text_path, lines=True)
+    elif text_path.endswith((".xlsx", ".xls")):
+        df = pd.read_excel(text_path)
+    else:
+        raise ValueError("Unsupported file format")
+
+    print(f"📂 Loaded {len(df)} records from {os.path.basename(text_path)}")
+
+    if true_label not in df.columns:
+        raise ValueError(f"Label column '{true_label}' not found in dataset")
+
+    # --- Detect unique labels in original space, then remap to 0..N-1 ---
+    unique_labels = sorted(df[true_label].dropna().unique())
+    num_classes   = len(unique_labels)
+    original_to_new = {int(orig): int(idx) for idx, orig in enumerate(unique_labels)}
+    new_to_original = {int(idx): int(orig) for orig, idx in original_to_new.items()}
+
+    # Remap in place for training
+    df[true_label] = df[true_label].map(original_to_new)
+
+    print(f"🔍 Detected {num_classes} classes: {unique_labels}")
+    print(f"🔁 Remapped labels for training -> 0-based indices: {original_to_new}")
+
+    # --- Train/validation split ---
+    if len(df) < 5:
+        train_df, val_df = df, df
+        print("⚠️ Dataset too small for validation split - using full dataset for training and validation.")
+    else:
+        val_size = max(1, int(len(df) * 0.2))
+        train_df = df.iloc[:-val_size].reset_index(drop=True)
+        val_df   = df.iloc[-val_size:].reset_index(drop=True)
+
+    # --- Device selection ---
+    training_device = device
+    if device.type == "mps":
+        training_device = torch.device("cpu")
+        print("⚠️ MPS detected - using CPU to avoid tensor layout issues.")
+    print(f"💻 Using device: {training_device}")
+
+    print("🧠 Training setup:")
+    print(f"   • Mode: {mode}")
+    print(f"   • Text columns: {text_column}")
+    print(f"   • Label column: {true_label} (remapped to 0..{num_classes-1})")
+    print(f"   • Number of classes: {num_classes}")
+    print(f"   • Batch size: {batch_size}, Epochs: {num_epochs}, LR: {learning_rate}")
+    if prompt:
+        print(f"   • Prompt: {prompt}")
+
+    # --- Model & processor ---
+    clip_model = CLIPModel.from_pretrained(base_model)
+    processor  = CLIPProcessor.from_pretrained(base_model)
+
+    train_dataset = NewsDataset(
+        train_df, processor, text_column=text_column, img_dir=img_dir,
+        use_text=use_text, use_image=use_image, true_label=true_label, prompt=prompt
+    )
+    val_dataset = NewsDataset(
+        val_df, processor, text_column=text_column, img_dir=img_dir,
+        use_text=use_text, use_image=use_image, true_label=true_label, prompt=prompt
+    )
+
+    train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True)
+    val_loader   = DataLoader(val_dataset, batch_size=batch_size, shuffle=False)
+
+    # --- Model, optimizer, loss ---
+    model = CLIPClassifier(clip_model, num_classes, use_text, use_image).to(training_device)
+    optimizer = AdamW(model.parameters(), lr=learning_rate)
+    criterion = torch.nn.CrossEntropyLoss()
+
+    # --- Training loop ---
+    best_accuracy = 0.0
+    for epoch in range(num_epochs):
+        model.train()
+        total_loss, correct, total = 0.0, 0, 0
+
+        for _, (inputs, labels) in enumerate(tqdm(train_loader, desc=f"Epoch {epoch+1}/{num_epochs} [Train]")):
+            for k, v in inputs.items():
+                inputs[k] = v.to(training_device)
+            labels = labels.to(training_device)
+
+            optimizer.zero_grad()
+            logits, _ = model(**inputs)
+            loss = criterion(logits, labels)
+            loss.backward()
+            optimizer.step()
+
+            total_loss += float(loss.item())
+            _, predicted = logits.max(1)
+            total += labels.size(0)
+            correct += predicted.eq(labels).sum().item()
+
+        train_acc  = 100.0 * correct / max(1, total)
+        train_loss = total_loss / max(1, len(train_loader))
+
+        # --- Validation ---
+        model.eval()
+        val_correct, val_total, val_loss_accum = 0, 0, 0.0
+        with torch.no_grad():
+            for inputs, labels in tqdm(val_loader, desc=f"Epoch {epoch+1}/{num_epochs} [Val]"):
+                for k, v in inputs.items():
+                    inputs[k] = v.to(training_device)
+                labels = labels.to(training_device)
+
+                logits, _ = model(**inputs)
+                vloss = criterion(logits, labels)
+                val_loss_accum += float(vloss.item())
+                _, predicted = logits.max(1)
+                val_total += labels.size(0)
+                val_correct += predicted.eq(labels).sum().item()
+
+        val_acc  = 100.0 * val_correct / max(1, val_total)
+        val_loss = val_loss_accum / max(1, len(val_loader))
+
+        print(f"Epoch {epoch+1}/{num_epochs}: Train Loss={train_loss:.4f} Acc={train_acc:.2f}% | Val Loss={val_loss:.4f} Acc={val_acc:.2f}%")
+
+        # --- Save best model with label mapping back to original labels ---
+        if val_acc > best_accuracy:
+            best_accuracy = val_acc
+            torch.save({
+                "model_state_dict": model.state_dict(),
+                "epoch": epoch + 1,
+                "best_accuracy": best_accuracy,
+                "num_classes": num_classes,
+                "label_mapping": new_to_original  # key: 0..N-1 -> original label
+            }, model_name)
+            print(f"✅ Model saved - new best validation accuracy: {best_accuracy:.2f}%")
+
+    print(f"🎯 Fine-tuning complete - best validation accuracy: {best_accuracy:.2f}%")
+    if best_accuracy == 0:
+      print("⚠ No valid model saved because validation accuracy stayed at 0%. Check data/labels/training setup.")
+
+    return best_accuracy
+# ==== PATCH: finetune_CLIP (end) =============================================
+
+
+# ==== PATCH: classification_CLIP_finetuned (start) ===========================
 def classification_CLIP_finetuned(
     mode=None,
     text_path=None,
@@ -295,7 +466,7 @@ def classification_CLIP_finetuned(
     prompt=None,
     model_name="best_clip_model.pth",
     batch_size=8,
-    num_classes=None,   # auto-detected
+    num_classes=None,   # auto-detected if None
     predict_column="label",
     true_label=None
 ):
@@ -323,17 +494,25 @@ def classification_CLIP_finetuned(
     try:
         checkpoint = torch.load(model_name, map_location=_device, weights_only=True)
     except Exception:
-        print("⚠️ Safe load failed, retrying with weights_only=False ...")
+        print("⚠️ Safe load failed - retrying with weights_only=False ...")
         checkpoint = torch.load(model_name, map_location=_device, weights_only=False)
 
-    # --- Auto-detect num_classes from checkpoint ---
+    # --- Mapping back to original labels if present ---
+    mapping_back = checkpoint.get("label_mapping", None)
+    if mapping_back is not None:
+        # convert possible tensor keys to int
+        mapping_back = {int(k): int(v) for k, v in mapping_back.items()}
+
+    # --- Auto-detect num_classes from checkpoint or mapping ---
     if num_classes is None:
-        num_classes = checkpoint.get("num_classes", None)
-        if num_classes is None:
-            if "model_state_dict" in checkpoint and "classifier.weight" in checkpoint["model_state_dict"]:
-                num_classes = checkpoint["model_state_dict"]["classifier.weight"].shape[0]
-            else:
-                num_classes = 2  # fallback
+        if "num_classes" in checkpoint and isinstance(checkpoint["num_classes"], int):
+            num_classes = checkpoint["num_classes"]
+        elif "model_state_dict" in checkpoint and "classifier.weight" in checkpoint["model_state_dict"]:
+            num_classes = checkpoint["model_state_dict"]["classifier.weight"].shape[0]
+        elif mapping_back is not None:
+            num_classes = len(mapping_back)
+        else:
+            num_classes = 2  # fallback
         print(f"🔍 Detected num_classes={num_classes} from checkpoint")
 
     # --- Build model skeleton ---
@@ -352,15 +531,13 @@ def classification_CLIP_finetuned(
         ckpt_head_dim = state_dict["classifier.weight"].shape[0]
         if ckpt_head_dim != num_classes:
             head_mismatch = True
-            print(f"⚠️ Head mismatch: checkpoint={ckpt_head_dim}, model={num_classes}. "
-                  f"Re-initializing classifier head ...")
-            # Remove incompatible head weights
+            print(f"⚠️ Head mismatch: checkpoint={ckpt_head_dim}, model={num_classes}. Re-initializing classifier head.")
             state_dict.pop("classifier.weight", None)
             state_dict.pop("classifier.bias", None)
 
     missing, unexpected = model.load_state_dict(state_dict, strict=False)
     if missing:
-        print(f"⚙️ Missing keys (expected for head reset): {missing}")
+        print(f"⚙️ Missing keys (ok if head was reset): {missing}")
     if unexpected:
         print(f"⚙️ Unexpected keys: {unexpected}")
     if head_mismatch:
@@ -368,7 +545,7 @@ def classification_CLIP_finetuned(
 
     model.eval()
 
-    # --- Dataset + Dataloader ---
+    # --- Dataset and DataLoader ---
     dataset = NewsDataset(
         df,
         processor,
@@ -389,183 +566,19 @@ def classification_CLIP_finetuned(
                 inputs[k] = v.to(_device)
             logits, _ = model(**inputs)
             _, predicted = logits.max(1)
-            predictions.extend((predicted + 1).cpu().numpy())
+
+            if mapping_back:
+                predictions.extend([mapping_back[int(p.cpu().item())] for p in predicted])
+            else:
+                # fallback - assume 1-based desired output
+                predictions.extend((predicted + 1).cpu().numpy())
 
     df[predict_column] = predictions
-    print(f"✅ Prediction complete! {len(df)} rows labeled.")
+    print(f"✅ Prediction complete - {len(df)} rows labeled with original class IDs.")
     return df
+# ==== PATCH: classification_CLIP_finetuned (end) =============================
 
 
-def finetune_CLIP(
-    mode="both",
-    text_path=None,
-    text_column=None,
-    img_dir=None,
-    true_label=None,
-    prompt=None,
-    model_name="best_clip_model.pth",
-    num_epochs=20,
-    batch_size=8,
-    learning_rate=1e-5
-):
-    """
-    Fine-tune CLIP on a text, image, or multimodal dataset.
-
-    Automatically detects the number of classes from the `true_label` column.
-    """
-
-    if mode not in ["text", "image", "both"]:
-        raise ValueError("mode must be one of 'text', 'image', or 'both'")
-
-    use_text  = mode in ["text", "both"]
-    use_image = mode in ["image", "both"]
-
-    if use_text and not text_path:
-        raise ValueError("text_path cannot be empty")
-    if use_image and not img_dir:
-        raise ValueError("img_dir cannot be empty")
-
-    # === Load dataset ===
-    if text_path.endswith(".csv") or text_path.endswith(".txt"):
-        df = pd.read_csv(text_path)
-    elif text_path.endswith(".jsonl"):
-        df = pd.read_json(text_path, lines=True)
-    elif text_path.endswith((".xlsx", ".xls")):
-        df = pd.read_excel(text_path)
-    else:
-        raise ValueError("Unsupported file format")
-
-    print(f"📂 Loaded {len(df)} records from {os.path.basename(text_path)}")
-
-    if true_label not in df.columns:
-        raise ValueError(f"Label column '{true_label}' not found in dataset")
-
-    # === Auto-detect number of classes ===
-    unique_labels = sorted(df[true_label].dropna().unique())
-    num_classes = len(unique_labels)
-
-    # Handle indexing (0 vs 1-based)
-    if 0 not in unique_labels and 1 in unique_labels:
-        label_min = int(min(unique_labels))
-        label_shift = 1 - label_min
-        if label_shift != 0:
-            df[true_label] = df[true_label] + label_shift
-    else:
-        label_shift = 0
-
-    print(f"🔍 Detected {num_classes} classes: {unique_labels}")
-    if label_shift != 0:
-        print(f"⚙️ Shifted labels by +{label_shift} for zero-based indexing.")
-
-    # === Train/validation split ===
-    if len(df) < 5:
-        train_df, val_df = df, df
-        print("⚠️ Dataset too small for validation split; using full dataset for training.")
-    else:
-        val_size = int(len(df) * 0.2)
-        train_df = df.iloc[:-val_size].reset_index(drop=True)
-        val_df   = df.iloc[-val_size:].reset_index(drop=True)
-
-    # === Device ===
-    training_device = device
-    if device.type == "mps":
-        training_device = torch.device("cpu")
-        print(f"⚠️ MPS detected → using CPU to avoid tensor layout issues.")
-    print(f"💻 Using device: {training_device}")
-
-    print(f"🧠 Training setup:")
-    print(f"   • Mode: {mode}")
-    print(f"   • Text columns: {text_column}")
-    print(f"   • Label column: {true_label}")
-    print(f"   • Number of classes: {num_classes}")
-    print(f"   • Batch size: {batch_size}, Epochs: {num_epochs}, LR: {learning_rate}")
-
-    if prompt:
-        print(f"   • Prompt: {prompt}")
-
-    # === Model & processor ===
-    clip_model = CLIPModel.from_pretrained(base_model)
-    processor  = CLIPProcessor.from_pretrained(base_model)
-
-    train_dataset = NewsDataset(
-        train_df, processor, text_column=text_column, img_dir=img_dir,
-        use_text=use_text, use_image=use_image, true_label=true_label, prompt=prompt
-    )
-    val_dataset = NewsDataset(
-        val_df, processor, text_column=text_column, img_dir=img_dir,
-        use_text=use_text, use_image=use_image, true_label=true_label, prompt=prompt
-    )
-
-    train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True)
-    val_loader   = DataLoader(val_dataset, batch_size=batch_size, shuffle=False)
-
-    # === Model, optimizer, loss ===
-    model = CLIPClassifier(clip_model, num_classes, use_text, use_image).to(training_device)
-    optimizer = AdamW(model.parameters(), lr=learning_rate)
-    criterion = torch.nn.CrossEntropyLoss()
-
-    # === Training loop ===
-    best_accuracy = 0.0
-    for epoch in range(num_epochs):
-        model.train()
-        total_loss, correct, total = 0, 0, 0
-
-        for batch_idx, (inputs, labels) in enumerate(tqdm(train_loader, desc=f"Epoch {epoch+1}/{num_epochs} [Train]")):
-            for k, v in inputs.items():
-                inputs[k] = v.to(training_device)
-            labels = labels.to(training_device)
-
-            optimizer.zero_grad()
-            logits, _ = model(**inputs)
-            loss = criterion(logits, labels)
-            loss.backward()
-            optimizer.step()
-
-            total_loss += loss.item()
-            _, predicted = logits.max(1)
-            total += labels.size(0)
-            correct += predicted.eq(labels).sum().item()
-
-        train_acc = 100. * correct / total
-        train_loss = total_loss / len(train_loader)
-
-        # === Validation ===
-        model.eval()
-        val_correct, val_total, val_loss = 0, 0, 0.0
-        with torch.no_grad():
-            for inputs, labels in tqdm(val_loader, desc=f"Epoch {epoch+1}/{num_epochs} [Val]"):
-                for k, v in inputs.items():
-                    inputs[k] = v.to(training_device)
-                labels = labels.to(training_device)
-
-                logits, _ = model(**inputs)
-                loss = criterion(logits, labels)
-                val_loss += loss.item()
-                _, predicted = logits.max(1)
-                val_total += labels.size(0)
-                val_correct += predicted.eq(labels).sum().item()
-
-        val_acc = 100. * val_correct / val_total if val_total else 0
-        val_loss = val_loss / len(val_loader)
-
-        print(f"Epoch {epoch+1}/{num_epochs}: "
-              f"Train Loss={train_loss:.4f} Acc={train_acc:.2f}% | "
-              f"Val Loss={val_loss:.4f} Acc={val_acc:.2f}%")
-
-        # === Save best model ===
-        if val_acc > best_accuracy:
-            best_accuracy = val_acc
-            torch.save({
-                "model_state_dict": model.state_dict(),
-                "epoch": epoch + 1,
-                "best_accuracy": best_accuracy,
-                "num_classes": num_classes,
-                "label_mapping": unique_labels
-            }, model_name)
-            print(f"✅ Model saved! New best validation accuracy: {best_accuracy:.2f}%")
-
-    print(f"🎯 Fine-tuning complete! Best validation accuracy: {best_accuracy:.2f}%")
-    return best_accuracy
 
 # =========================
 # Shared utilities
